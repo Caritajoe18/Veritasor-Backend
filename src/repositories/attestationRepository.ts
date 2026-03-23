@@ -337,7 +337,7 @@ export async function update(
     }
     const dbKey = key.replace(/([A-Z])/g, '_$1').toLowerCase();
     if (allowedFields.includes(dbKey)) {
-      setClauses.push(`${dbKey} = ${paramIndex}`);
+      setClauses.push(`${dbKey} = \${paramIndex}`);
       params.push(value);
       paramIndex++;
     }
@@ -352,7 +352,7 @@ export async function update(
     sql = `
       UPDATE attestations
       SET ${setClauses.join(', ')}
-      WHERE id = ${paramIndex} AND version = ${paramIndex + 1}
+      WHERE id = \${paramIndex} AND version = \${paramIndex + 1}
       RETURNING *
     `;
     params.push(id, expectedVersion);
@@ -360,7 +360,7 @@ export async function update(
     sql = `
       UPDATE attestations
       SET ${setClauses.join(', ')}
-      WHERE id = ${paramIndex}
+      WHERE id = \${paramIndex}
       RETURNING *
     `;
     params.push(id);

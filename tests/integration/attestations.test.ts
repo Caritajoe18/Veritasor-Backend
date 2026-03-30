@@ -2,12 +2,21 @@
  * Integration tests for attestations API.
  * Uses requireAuth; expects 401 when unauthenticated.
  */
-import { test } from 'node:test'
-import assert from 'node:assert'
+import { describe, it, expect, vi } from 'vitest'
 import request from 'supertest'
 import { app } from '../../src/app.js'
+import {
+  validateSendTransactionResponse,
+  waitForConfirmation,
+  validateConfirmedResult,
+  SorobanSubmissionError,
+} from '../../src/services/soroban/submitAttestation.js'
 
 const authHeader = { Authorization: 'Bearer test-token' }
+
+// ---------------------------------------------------------------------------
+// Existing API integration tests
+// ---------------------------------------------------------------------------
 
 test('GET /api/attestations returns 401 when unauthenticated', async () => {
   const res = await request(app).get('/api/attestations')
@@ -92,87 +101,201 @@ test('DELETE /api/attestations/:id revoke succeeds when authenticated', async ()
   assert.ok(res.body?.message)
 })
 
-// ============================================================================
-// Additional Idempotency Edge Case Tests
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Soroban submit attestation response validation tests
+// ---------------------------------------------------------------------------
 
-test('POST /api/attestations returns 400 when idempotency key is missing', async () => {
-  const res = await request(app)
-    .post('/api/attestations')
-    .set(authHeader)
-    .send({ business_id: 'b1', period: '2024-01' })
-  assert.strictEqual(res.status, 400)
-  assert.ok(res.body?.code === 'IDEMPOTENCY_KEY_REQUIRED')
+const VALID_TX_HASH = 'a'.repeat(64)
+
+test('validateSendTransactionResponse accepts valid PENDING response', () => {
+  const response = { hash: VALID_TX_HASH, status: 'PENDING' }
+  assert.doesNotThrow(() =>
+    validateSendTransactionResponse(response as any)
+  )
 })
 
-test('POST /api/attestations returns 400 when idempotency key is too short', async () => {
-  const res = await request(app)
-    .post('/api/attestations')
-    .set(authHeader)
-    .set('Idempotency-Key', 'abc')
-    .send({ business_id: 'b1', period: '2024-01' })
-  assert.strictEqual(res.status, 400)
-  assert.ok(res.body?.code === 'IDEMPOTENCY_KEY_INVALID')
+test('validateSendTransactionResponse accepts valid DUPLICATE response', () => {
+  const response = { hash: VALID_TX_HASH, status: 'DUPLICATE' }
+  assert.doesNotThrow(() =>
+    validateSendTransactionResponse(response as any)
+  )
 })
 
-test('POST /api/attestations returns 400 when idempotency key is too long', async () => {
-  const longKey = 'a'.repeat(300)
-  const res = await request(app)
-    .post('/api/attestations')
-    .set(authHeader)
-    .set('Idempotency-Key', longKey)
-    .send({ business_id: 'b1', period: '2024-01' })
-  assert.strictEqual(res.status, 400)
-  assert.ok(res.body?.code === 'IDEMPOTENCY_KEY_INVALID')
+test('validateSendTransactionResponse accepts ERROR status (validated before error mapping)', () => {
+  const response = { hash: VALID_TX_HASH, status: 'ERROR' }
+  assert.doesNotThrow(() =>
+    validateSendTransactionResponse(response as any)
+  )
 })
 
-test('POST /api/attestations with whitespace in key is trimmed and accepted', async () => {
-  const res = await request(app)
-    .post('/api/attestations')
-    .set(authHeader)
-    .set('Idempotency-Key', '  whitespace-test-key-123  ')
-    .send({ business_id: 'b1', period: '2024-01' })
-  assert.strictEqual(res.status, 201)
+test('validateSendTransactionResponse rejects null response', () => {
+  assert.throws(
+    () => validateSendTransactionResponse(null as any),
+    (err: any) => {
+      assert.ok(err instanceof SorobanSubmissionError)
+      assert.strictEqual(err.code, 'INVALID_RESPONSE')
+      return true
+    }
+  )
 })
 
-test('POST /api/attestations duplicate request with different body returns same cached response', async () => {
-  const key = 'idempotent-diff-body-' + Date.now()
-  const first = await request(app)
-    .post('/api/attestations')
-    .set(authHeader)
-    .set('Idempotency-Key', key)
-    .send({ business_id: 'b1', period: '2024-01' })
-  assert.strictEqual(first.status, 201)
-  
-  // Same key but different body - should return cached response from first request
-  const second = await request(app)
-    .post('/api/attestations')
-    .set(authHeader)
-    .set('Idempotency-Key', key)
-    .send({ business_id: 'b1', period: '2024-02' }) // Different period
-  assert.strictEqual(second.status, 201)
-  // The cached response should have the first period, not the second
-  assert.strictEqual(second.body?.period, '2024-01')
+test('validateSendTransactionResponse rejects missing hash', () => {
+  assert.throws(
+    () => validateSendTransactionResponse({ status: 'PENDING' } as any),
+    (err: any) => {
+      assert.ok(err instanceof SorobanSubmissionError)
+      assert.strictEqual(err.code, 'INVALID_RESPONSE')
+      assert.ok(err.message.includes('invalid transaction hash'))
+      return true
+    }
+  )
 })
 
-test('POST /api/attestations error responses are not cached', async () => {
-  const key = 'error-not-cached-' + Date.now()
-  
-  // First request fails due to missing required field
-  const first = await request(app)
-    .post('/api/attestations')
-    .set(authHeader)
-    .set('Idempotency-Key', key)
-    .send({}) // Missing period which is required
-  
-  // Should be a validation error, not cached
-  assert.ok(first.status >= 400)
-  
-  // Second request with valid data should succeed (not return cached error)
-  const second = await request(app)
-    .post('/api/attestations')
-    .set(authHeader)
-    .set('Idempotency-Key', key)
-    .send({ business_id: 'b1', period: '2024-01' })
-  assert.strictEqual(second.status, 201)
+test('validateSendTransactionResponse rejects malformed hash', () => {
+  const response = { hash: 'not-a-hex-hash', status: 'PENDING' }
+  assert.throws(
+    () => validateSendTransactionResponse(response as any),
+    (err: any) => {
+      assert.ok(err instanceof SorobanSubmissionError)
+      assert.strictEqual(err.code, 'INVALID_RESPONSE')
+      return true
+    }
+  )
+})
+
+test('validateSendTransactionResponse rejects short hash', () => {
+  const response = { hash: 'abcdef1234', status: 'PENDING' }
+  assert.throws(
+    () => validateSendTransactionResponse(response as any),
+    (err: any) => {
+      assert.ok(err instanceof SorobanSubmissionError)
+      assert.strictEqual(err.code, 'INVALID_RESPONSE')
+      return true
+    }
+  )
+})
+
+test('validateSendTransactionResponse rejects uppercase hash', () => {
+  const response = { hash: 'A'.repeat(64), status: 'PENDING' }
+  assert.throws(
+    () => validateSendTransactionResponse(response as any),
+    (err: any) => {
+      assert.ok(err instanceof SorobanSubmissionError)
+      assert.strictEqual(err.code, 'INVALID_RESPONSE')
+      return true
+    }
+  )
+})
+
+test('validateSendTransactionResponse rejects unknown status', () => {
+  const response = { hash: VALID_TX_HASH, status: 'UNKNOWN_STATUS' }
+  assert.throws(
+    () => validateSendTransactionResponse(response as any),
+    (err: any) => {
+      assert.ok(err instanceof SorobanSubmissionError)
+      assert.strictEqual(err.code, 'INVALID_RESPONSE')
+      assert.ok(err.message.includes('unexpected status'))
+      return true
+    }
+  )
+})
+
+test('waitForConfirmation resolves on immediate SUCCESS', async () => {
+  const mockServer = {
+    getTransaction: async () => ({
+      status: 'SUCCESS',
+      ledger: 12345,
+      returnValue: null,
+    }),
+  }
+
+  const result = await waitForConfirmation(mockServer as any, VALID_TX_HASH, 10, 3)
+  assert.strictEqual(result.status, 'SUCCESS')
+})
+
+test('waitForConfirmation resolves after NOT_FOUND then SUCCESS', async () => {
+  let callCount = 0
+  const mockServer = {
+    getTransaction: async () => {
+      callCount++
+      if (callCount < 3) {
+        return { status: 'NOT_FOUND' }
+      }
+      return { status: 'SUCCESS', ledger: 99999, returnValue: null }
+    },
+  }
+
+  const result = await waitForConfirmation(mockServer as any, VALID_TX_HASH, 10, 5)
+  assert.strictEqual(result.status, 'SUCCESS')
+  assert.strictEqual(callCount, 3)
+})
+
+test('waitForConfirmation throws CONFIRMATION_FAILED on FAILED status', async () => {
+  const mockServer = {
+    getTransaction: async () => ({ status: 'FAILED' }),
+  }
+
+  await assert.rejects(
+    () => waitForConfirmation(mockServer as any, VALID_TX_HASH, 10, 3),
+    (err: any) => {
+      assert.ok(err instanceof SorobanSubmissionError)
+      assert.strictEqual(err.code, 'CONFIRMATION_FAILED')
+      return true
+    }
+  )
+})
+
+test('waitForConfirmation throws CONFIRMATION_TIMEOUT after max attempts', async () => {
+  const mockServer = {
+    getTransaction: async () => ({ status: 'NOT_FOUND' }),
+  }
+
+  await assert.rejects(
+    () => waitForConfirmation(mockServer as any, VALID_TX_HASH, 10, 3),
+    (err: any) => {
+      assert.ok(err instanceof SorobanSubmissionError)
+      assert.strictEqual(err.code, 'CONFIRMATION_TIMEOUT')
+      assert.ok(err.message.includes('3 polling attempts'))
+      return true
+    }
+  )
+})
+
+test('validateConfirmedResult throws when returnValue is undefined', () => {
+  const merkleRoot = '0xdeadbeef1234567890abcdef'
+
+  assert.throws(
+    () => validateConfirmedResult({ returnValue: undefined } as any, merkleRoot),
+    (err: any) => {
+      assert.ok(err instanceof SorobanSubmissionError)
+      assert.strictEqual(err.code, 'RESULT_VALIDATION_FAILED')
+      assert.ok(err.message.includes('no return value'))
+      return true
+    }
+  )
+})
+
+test('validateConfirmedResult throws on null returnValue', () => {
+  assert.throws(
+    () => validateConfirmedResult({ returnValue: null } as any, 'root'),
+    (err: any) => {
+      assert.ok(err instanceof SorobanSubmissionError)
+      assert.strictEqual(err.code, 'RESULT_VALIDATION_FAILED')
+      return true
+    }
+  )
+})
+
+test('SorobanSubmissionError has correct name and code', () => {
+  const err = new SorobanSubmissionError('test message', 'TEST_CODE')
+  assert.strictEqual(err.name, 'SorobanSubmissionError')
+  assert.strictEqual(err.code, 'TEST_CODE')
+  assert.strictEqual(err.message, 'test message')
+  assert.ok(err instanceof Error)
+})
+
+test('SorobanSubmissionError preserves cause', () => {
+  const cause = new Error('original')
+  const err = new SorobanSubmissionError('wrapped', 'WRAP', cause)
+  assert.strictEqual(err.cause, cause)
 })

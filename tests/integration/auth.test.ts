@@ -90,6 +90,13 @@ function expectErrorEnvelope(
  */
 function createMockAuthRouter() {
   const router = express.Router();
+  const routeRateLimiters = {
+    login: rateLimiter({ bucket: "test-auth:login", max: 3, windowMs: 60_000 }),
+    refresh: rateLimiter({ bucket: "test-auth:refresh", max: 3, windowMs: 60_000 }),
+    forgotPassword: rateLimiter({ bucket: "test-auth:forgot-password", max: 2, windowMs: 60_000 }),
+    resetPassword: rateLimiter({ bucket: "test-auth:reset-password", max: 2, windowMs: 60_000 }),
+    me: rateLimiter({ bucket: "test-auth:me", max: 5, windowMs: 60_000 }),
+  };
 
   // POST /auth/signup
   router.post("/signup", (req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -392,6 +399,7 @@ beforeEach(() => {
   userStore = [];
   tokenStore = [];
   resetTokenStore = [];
+  resetRateLimiterStore();
 });
 
 afterAll(() => {

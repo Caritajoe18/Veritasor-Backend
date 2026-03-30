@@ -1,34 +1,11 @@
 /**
- * Shopify OAuth callback: validate state, exchange code for access token, store token.
- * Access tokens are never logged.
+ * Shopify OAuth callback: validate state, exchange code for an access token,
+ * and persist the connected installation.
+ * Access tokens are never logged or returned.
  */
 
-import { createHmac, timingSafeEqual } from 'node:crypto'
+import * as integrationRepository from '../../../repositories/integration.js'
 import * as store from './store.js'
-
-// Module-level constants kept for backward compat; handleCallback reads fresh values inside the function
-const clientId = process.env.SHOPIFY_CLIENT_ID ?? ''
-const clientSecret = process.env.SHOPIFY_CLIENT_SECRET ?? ''
-
-const SHOP_HOST_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9\-]*\.myshopify\.com$/
-
-/**
- * Compute the Shopify HMAC-SHA256 signature for a set of callback query parameters.
- * The `hmac` key is excluded from the digest input per Shopify's specification.
- *
- * @param secret - SHOPIFY_CLIENT_SECRET used as the HMAC key
- * @param params - All callback query parameters (including or excluding `hmac`)
- * @returns Lowercase hex-encoded HMAC-SHA256 digest
- */
-export function computeShopifyHmac(secret: string, params: Record<string, string>): string {
-  const queryString = Object.keys(params)
-    .filter(key => key !== 'hmac')
-    .sort()
-    .map(key => `${key}=${encodeURIComponent(params[key])}`)
-    .join('&')
-
-  return createHmac('sha256', secret).update(queryString).digest('hex')
-}
 
 export interface CallbackParams {
   code: string
@@ -47,14 +24,10 @@ export interface CallbackResult {
 /**
  * Handle OAuth callback: consume state, exchange code for token, persist via integration store.
  */
-export async function handleCallback(params: Record<string, string>): Promise<CallbackResult> {
-  // Read fresh values so tests can override process.env before calling this function
-  const currentClientId = process.env.SHOPIFY_CLIENT_ID ?? ''
-  const currentClientSecret = process.env.SHOPIFY_CLIENT_SECRET ?? ''
-
-  if (!currentClientId || !currentClientSecret) {
-    return { success: false, error: 'Shopify app not configured' }
-  }
+export async function handleCallback(params: CallbackParams): Promise<CallbackResult> {
+  const { code, shop, state } = params
+  const clientId = process.env.SHOPIFY_CLIENT_ID ?? ''
+  const clientSecret = process.env.SHOPIFY_CLIENT_SECRET ?? ''
 
   const { code, shop, state, hmac } = params
 
@@ -79,13 +52,13 @@ export async function handleCallback(params: Record<string, string>): Promise<Ca
     return { success: false, error: 'Invalid HMAC signature' }
   }
 
-  const shopHost = shop.trim().toLowerCase()
-  if (!SHOP_HOST_REGEX.test(shopHost)) {
+  const shopHost = store.normalizeShop(shop)
+  if (!store.isValidShopHost(shopHost)) {
     return { success: false, error: 'Invalid shop hostname' }
   }
 
-  const storedShop = store.consumeOAuthState(state)
-  if (!storedShop || storedShop !== shopHost) {
+  const stateRecord = store.consumeOAuthState(state)
+  if (!stateRecord || stateRecord.shop !== shopHost) {
     return { success: false, error: 'Invalid or expired state' }
   }
 
@@ -118,5 +91,39 @@ export async function handleCallback(params: Record<string, string>): Promise<Ca
   }
 
   store.saveToken(shopHost, accessToken)
+
+  const existingShopifyIntegration = (await integrationRepository.listByUserId(stateRecord.userId)).find(
+    (integration) => integration.provider === 'shopify',
+  )
+
+  if (existingShopifyIntegration && existingShopifyIntegration.externalId !== shopHost) {
+    await integrationRepository.deleteById(existingShopifyIntegration.id)
+    store.deleteToken(existingShopifyIntegration.externalId)
+  }
+
+  const reusableIntegration =
+    existingShopifyIntegration && existingShopifyIntegration.externalId === shopHost
+      ? existingShopifyIntegration
+      : null
+
+  if (reusableIntegration) {
+    const updated = await integrationRepository.update(reusableIntegration.id, {
+      token: { accessToken },
+      metadata: { shop: shopHost },
+    })
+
+    if (!updated) {
+      return { success: false, error: 'Failed to persist Shopify integration' }
+    }
+  } else {
+    await integrationRepository.create({
+      userId: stateRecord.userId,
+      provider: 'shopify',
+      externalId: shopHost,
+      token: { accessToken },
+      metadata: { shop: shopHost },
+    })
+  }
+
   return { success: true, shop: shopHost }
 }

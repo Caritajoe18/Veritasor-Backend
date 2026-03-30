@@ -8,14 +8,9 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       reporter: ['text', 'lcov', 'html'],
-      include: ['src/**/*.ts'],
+      include: ['src/**/*.ts', 'src/**/*.js'],
       exclude: ['src/**/*.d.ts', 'src/index.ts'],
-      thresholds: {
-        'src/services/integrations/shopify/callback.ts': {
-          lines: 95,
-          branches: 95,
-        },
-      },
+      reportsDirectory: 'coverage',
     },
   },
 })

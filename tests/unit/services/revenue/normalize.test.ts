@@ -1,10 +1,9 @@
-import { describe, it, expect, vi } from "vitest";
-import { normalizeRevenueEntry } from "../../../../src/services/revenue/normalize.js";
+import { describe, it, expect } from "vitest";
 import {
-  detectRevenueAnomaly,
-  calibrateFromSeries,
-} from "../../../../src/services/revenue/anomalyDetection.js";
-import type { MonthlyRevenue } from "../../../../src/services/revenue/anomalyDetection.js";
+  normalizeRevenueEntry,
+  detectNormalizationDrift,
+} from "../../../../src/services/revenue/normalize.js";
+import type { NormalizedRevenue, NormalizationBaseline } from "../../../../src/services/revenue/normalize.js";
 
 describe("revenue normalizer", () => {
   it("should produce the canonical shape", () => {
@@ -123,214 +122,206 @@ describe("revenue normalizer", () => {
   });
 });
 
-describe("anomaly scoring calibration hooks", () => {
-  const stable: MonthlyRevenue[] = [
-    { period: "2026-01", amount: 10_000 },
-    { period: "2026-02", amount: 10_200 },
-    { period: "2026-03", amount: 9_800 },
-  ];
+describe("detectNormalizationDrift", () => {
+  const baseline: NormalizationBaseline = {
+    refundRate: 0.1,
+    unknownSourceRate: 0.05,
+    usdRate: 0.8,
+    meanAmount: 100,
+  };
 
-  const withDrop: MonthlyRevenue[] = [
-    { period: "2026-01", amount: 10_000 },
-    { period: "2026-02", amount: 10_500 },
-    { period: "2026-03", amount: 3_000 }, // ~71% drop
-  ];
+  function makeEntry(overrides: Partial<NormalizedRevenue> = {}): NormalizedRevenue {
+    return {
+      id: "txn_test",
+      amount: 100,
+      currency: "USD",
+      date: "2025-01-01T00:00:00.000Z",
+      type: "payment",
+      source: "stripe",
+      ...overrides,
+    };
+  }
 
-  const withSpike: MonthlyRevenue[] = [
-    { period: "2026-01", amount: 1_000 },
-    { period: "2026-02", amount: 1_100 },
-    { period: "2026-03", amount: 5_000 }, // 354% rise
-  ];
+  it("should return insufficient_data when entry count is below minimum", () => {
+    const entries = [makeEntry(), makeEntry(), makeEntry()]; // 3 < default min 5
+    const result = detectNormalizationDrift(entries, baseline);
 
-
-  it("should behave identically with no calibration argument", () => {
-    const withArg = detectRevenueAnomaly(withDrop, {});
-    const withoutArg = detectRevenueAnomaly(withDrop);
-
-    expect(withArg).toEqual(withoutArg);
+    expect(result.hasDrift).toBe(false);
+    expect(result.overallScore).toBe(0);
+    expect(result.checks[0].flag).toBe("insufficient_data");
+    expect(result.summary).toContain("Insufficient data");
   });
 
-  // --- minDataPoints ---
+  it("should return insufficient_data for an empty array", () => {
+    const result = detectNormalizationDrift([], baseline);
 
-  it("should respect custom minDataPoints", () => {
-    const result = detectRevenueAnomaly(
-      [{ period: "2026-01", amount: 1_000 }],
-      { minDataPoints: 1 }
-    );
-
-    expect(result.flag).not.toBe("insufficient_data");
-    expect(result.flag).toBe("ok");
+    expect(result.hasDrift).toBe(false);
+    expect(result.checks[0].flag).toBe("insufficient_data");
   });
 
-  it("should return insufficient_data when series is shorter than minDataPoints", () => {
-    const result = detectRevenueAnomaly(stable, { minDataPoints: 10 });
-
-    expect(result.flag).toBe("insufficient_data");
-    expect(result.score).toBe(0);
-    expect(result.detail).toContain("10");
-  });
-
-  // --- dropThreshold ---
-
-  it("should flag unusual_drop with default threshold when revenue falls ≥ 40%", () => {
-    const result = detectRevenueAnomaly(withDrop);
-
-    expect(result.flag).toBe("unusual_drop");
-  });
-
-  it("should NOT flag unusual_drop when custom dropThreshold is set above the actual drop", () => {
-    // The drop in withDrop is ~71%; setting threshold to 0.8 (80%) should suppress it.
-    const result = detectRevenueAnomaly(withDrop, { dropThreshold: 0.8 });
-
-    expect(result.flag).toBe("ok");
-    expect(result.score).toBe(0);
-  });
-
-  it("should flag unusual_drop at a tighter custom dropThreshold", () => {
-    // stable series has a 3.9% drop; threshold 0.03 (3%) should flag it.
-    const result = detectRevenueAnomaly(stable, { dropThreshold: 0.03 });
-
-    expect(result.flag).toBe("unusual_drop");
-  });
-
-  // --- spikeThreshold ---
-
-  it("should flag unusual_spike with default threshold when revenue rises ≥ 300%", () => {
-    const result = detectRevenueAnomaly(withSpike);
-
-    expect(result.flag).toBe("unusual_spike");
-  });
-
-  it("should NOT flag unusual_spike when custom spikeThreshold is set above the actual spike", () => {
-    // Spike in withSpike is 354%; setting threshold to 5.0 (500%) suppresses it.
-    const result = detectRevenueAnomaly(withSpike, { spikeThreshold: 5.0 });
-
-    expect(result.flag).toBe("ok");
-  });
-
-  it("should flag unusual_spike at a tighter custom spikeThreshold", () => {
-    // stable series has a 2% rise; threshold 0.01 (1%) should flag it.
-    const result = detectRevenueAnomaly(stable, { spikeThreshold: 0.01 });
-
-    expect(result.flag).toBe("unusual_spike");
-  });
-
-  // --- scoreHook ---
-
-  it("should call scoreHook with correct prev, curr, and change arguments", () => {
-    const hook = vi.fn().mockReturnValue(null); // null → fall back to built-in
-    detectRevenueAnomaly(stable, { scoreHook: hook });
-
-    // stable has 3 points → 2 consecutive pairs
-    expect(hook).toHaveBeenCalledTimes(2);
-
-    const [prev1, curr1, change1] = hook.mock.calls[0];
-    expect(prev1.period).toBe("2026-01");
-    expect(curr1.period).toBe("2026-02");
-    expect(change1).toBeCloseTo(0.02, 5);
-  });
-
-  it("should use scoreHook result when hook returns non-null", () => {
-    // Hook always flags unusual_spike with score 0.9, regardless of data.
-    const hook = vi.fn().mockReturnValue({ score: 0.9, flag: "unusual_spike" });
-    const result = detectRevenueAnomaly(stable, { scoreHook: hook });
-
-    expect(result.flag).toBe("unusual_spike");
-    expect(result.score).toBe(0.9);
-    expect(result.detail).toContain("unusual_spike");
-  });
-
-  it("should fall back to built-in logic when scoreHook returns null", () => {
-    // Hook returns null → built-in logic runs and detects the real drop.
-    const hook = vi.fn().mockReturnValue(null);
-    const result = detectRevenueAnomaly(withDrop, { scoreHook: hook });
-
-    expect(result.flag).toBe("unusual_drop");
-    expect(hook).toHaveBeenCalledTimes(2);
-  });
-
-  it("should track the worst score across all hook results", () => {
-    // First pair returns score 0.3, second returns score 0.8 → worst wins.
-    const hook = vi
-      .fn()
-      .mockReturnValueOnce({ score: 0.3, flag: "unusual_drop" })
-      .mockReturnValueOnce({ score: 0.8, flag: "unusual_spike" });
-
-    const result = detectRevenueAnomaly(stable, { scoreHook: hook });
-
-    expect(result.score).toBe(0.8);
-    expect(result.flag).toBe("unusual_spike");
-  });
-
-  // --- calibrateFromSeries ---
-
-  it("should return module defaults when series has fewer than 2 points", () => {
-    const result = calibrateFromSeries([{ period: "2026-01", amount: 1_000 }]);
-
-    expect(result.dropThreshold).toBe(0.4);
-    expect(result.spikeThreshold).toBe(3.0);
-    expect(result.mean).toBe(0);
-    expect(result.stdDev).toBe(0);
-  });
-
-  it("should return module defaults for an empty series", () => {
-    const result = calibrateFromSeries([]);
-
-    expect(result.dropThreshold).toBe(0.4);
-    expect(result.spikeThreshold).toBe(3.0);
-  });
-
-  it("should derive non-default thresholds from a series with variance", () => {
-    // Volatile series: big swings → stdDev > 0 → thresholds should differ from defaults.
-    const volatile: MonthlyRevenue[] = [
-      { period: "2026-01", amount: 1_000 },
-      { period: "2026-02", amount: 3_000 }, // +200%
-      { period: "2026-03", amount: 500 },   // -83%
-      { period: "2026-04", amount: 4_000 }, // +700%
+  it("should report no drift when entries exactly match the baseline", () => {
+    // 10 entries: 1 refund (10%), 1 unknown source (10%), 8 USD (80%), avg amount 100
+    const matchingBaseline: NormalizationBaseline = {
+      refundRate: 0.1,
+      unknownSourceRate: 0.1,
+      usdRate: 0.8,
+      meanAmount: 100,
+    };
+    const entries: NormalizedRevenue[] = [
+      makeEntry({ type: "refund", amount: -100 }),
+      makeEntry({ source: "unknown" }),
+      makeEntry({ currency: "EUR" }),
+      makeEntry({ currency: "EUR" }),
+      ...Array.from({ length: 6 }, () => makeEntry()),
     ];
 
-    const result = calibrateFromSeries(volatile);
+    const result = detectNormalizationDrift(entries, matchingBaseline);
 
-    expect(result.stdDev).toBeGreaterThan(0);
-    expect(result.mean).toBeDefined();
-    // Thresholds should be positive numbers
-    expect(result.dropThreshold).toBeGreaterThan(0);
-    expect(result.spikeThreshold).toBeGreaterThan(0);
+    expect(result.hasDrift).toBe(false);
+    expect(result.summary).toBe("No normalization drift detected.");
   });
 
-  it("should respect a custom sigmaMultiplier", () => {
-    const volatile: MonthlyRevenue[] = [
-      { period: "2026-01", amount: 1_000 },
-      { period: "2026-02", amount: 3_000 },
-      { period: "2026-03", amount: 500 },
+  it("should flag refund_rate_drift when refund fraction deviates significantly", () => {
+    // 3 refunds out of 5 = 60% vs baseline 10%
+    const entries: NormalizedRevenue[] = [
+      makeEntry({ type: "refund", amount: -100 }),
+      makeEntry({ type: "refund", amount: -100 }),
+      makeEntry({ type: "refund", amount: -100 }),
+      makeEntry(),
+      makeEntry(),
     ];
 
-    const narrow = calibrateFromSeries(volatile, { sigmaMultiplier: 1 });
-    const wide = calibrateFromSeries(volatile, { sigmaMultiplier: 3 });
+    const result = detectNormalizationDrift(entries, baseline);
+    const refundCheck = result.checks.find((c) => c.metric === "refund_rate");
 
-    // Wider sigma → more extreme thresholds (higher spike, lower or same drop)
-    expect(wide.spikeThreshold).toBeGreaterThanOrEqual(narrow.spikeThreshold);
+    expect(result.hasDrift).toBe(true);
+    expect(refundCheck?.flag).toBe("refund_rate_drift");
   });
 
-  it("should integrate calibrateFromSeries result into detectRevenueAnomaly", () => {
-    // Calibrate on a stable series — thresholds should be tight.
-    const history: MonthlyRevenue[] = Array.from({ length: 12 }, (_, i) => ({
-      period: `2025-${String(i + 1).padStart(2, "0")}`,
-      amount: 10_000 + (i % 3) * 100, // small oscillation
-    }));
+  it("should flag unknown_source_drift when unknown source fraction deviates", () => {
+    // 4 unknown sources out of 5 = 80% vs baseline 5%
+    const entries: NormalizedRevenue[] = [
+      makeEntry({ source: "unknown" }),
+      makeEntry({ source: "unknown" }),
+      makeEntry({ source: "unknown" }),
+      makeEntry({ source: "unknown" }),
+      makeEntry(),
+    ];
 
-    const cal = calibrateFromSeries(history);
+    const result = detectNormalizationDrift(entries, baseline);
+    const sourceCheck = result.checks.find((c) => c.metric === "unknown_source_rate");
 
-    // A series with a dramatic drop should still be caught.
-    const result = detectRevenueAnomaly(
-      [
-        { period: "2026-01", amount: 10_000 },
-        { period: "2026-02", amount: 1_000 }, // 90% drop
-      ],
-      cal
+    expect(result.hasDrift).toBe(true);
+    expect(sourceCheck?.flag).toBe("unknown_source_drift");
+  });
+
+  it("should flag usd_rate_drift when USD currency fraction deviates", () => {
+    // 0 USD entries out of 5 = 0% vs baseline 80%
+    const entries: NormalizedRevenue[] = Array.from({ length: 5 }, () =>
+      makeEntry({ currency: "EUR" })
     );
 
-    expect(result.flag).toBe("unusual_drop");
-    expect(result.score).toBeGreaterThan(0);
+    const result = detectNormalizationDrift(entries, baseline);
+    const usdCheck = result.checks.find((c) => c.metric === "usd_rate");
+
+    expect(result.hasDrift).toBe(true);
+    expect(usdCheck?.flag).toBe("usd_rate_drift");
+  });
+
+  it("should flag amount_drift when mean amount deviates significantly", () => {
+    // avg amount 10000 vs baseline 100 → 9900% relative deviation
+    const entries: NormalizedRevenue[] = Array.from({ length: 5 }, () =>
+      makeEntry({ amount: 10000 })
+    );
+
+    const result = detectNormalizationDrift(entries, baseline);
+    const amountCheck = result.checks.find((c) => c.metric === "mean_amount");
+
+    expect(result.hasDrift).toBe(true);
+    expect(amountCheck?.flag).toBe("amount_drift");
+  });
+
+  it("should detect multiple drifting metrics simultaneously", () => {
+    // High refund rate AND high unknown source rate; amounts kept at 100
+    const entries: NormalizedRevenue[] = [
+      makeEntry({ type: "refund", amount: -100, source: "unknown" }),
+      makeEntry({ type: "refund", amount: -100, source: "unknown" }),
+      makeEntry({ type: "refund", amount: -100, source: "unknown" }),
+      makeEntry({ source: "unknown" }),
+      makeEntry(),
+    ];
+
+    const result = detectNormalizationDrift(entries, baseline);
+    const driftedFlags = result.checks
+      .filter((c) => c.flag !== "ok")
+      .map((c) => c.flag);
+
+    expect(result.hasDrift).toBe(true);
+    expect(driftedFlags).toContain("refund_rate_drift");
+    expect(driftedFlags).toContain("unknown_source_drift");
+  });
+
+  it("should respect custom threshold and suppress drift below it", () => {
+    // Refund rate: 2/10 = 20% vs baseline 10% → 100% relative deviation
+    // With a 200% threshold no drift should be flagged
+    const entries: NormalizedRevenue[] = [
+      makeEntry({ type: "refund", amount: -100 }),
+      makeEntry({ type: "refund", amount: -100 }),
+      ...Array.from({ length: 8 }, () => makeEntry()),
+    ];
+
+    const result = detectNormalizationDrift(entries, baseline, { threshold: 2.0 });
+    const refundCheck = result.checks.find((c) => c.metric === "refund_rate");
+
+    expect(refundCheck?.flag).toBe("ok");
+  });
+
+  it("should respect custom minEntries option", () => {
+    // 3 entries is below the default minimum of 5, but above minEntries: 2
+    const entries: NormalizedRevenue[] = [makeEntry(), makeEntry(), makeEntry()];
+    const result = detectNormalizationDrift(entries, baseline, { minEntries: 2 });
+
+    expect(result.checks[0].flag).not.toBe("insufficient_data");
+  });
+
+  it("should set overallScore to the maximum score across all checks", () => {
+    // Severe amount drift → score clamped to 1.0
+    const entries: NormalizedRevenue[] = Array.from({ length: 5 }, () =>
+      makeEntry({ amount: 10000 })
+    );
+
+    const result = detectNormalizationDrift(entries, baseline);
+    const maxScore = Math.max(...result.checks.map((c) => c.score));
+
+    expect(result.overallScore).toBe(maxScore);
+    expect(result.overallScore).toBeGreaterThan(0);
+  });
+
+  it("should handle zero baseline rate with zero observed — no drift", () => {
+    const zeroBaseline = { ...baseline, unknownSourceRate: 0 };
+    const entries: NormalizedRevenue[] = Array.from({ length: 5 }, () => makeEntry());
+
+    const result = detectNormalizationDrift(entries, zeroBaseline);
+    const sourceCheck = result.checks.find((c) => c.metric === "unknown_source_rate");
+
+    expect(sourceCheck?.flag).toBe("ok");
+    expect(sourceCheck?.score).toBe(0);
+  });
+
+  it("should flag drift when baseline rate is zero but observed is non-zero", () => {
+    const zeroBaseline = { ...baseline, unknownSourceRate: 0 };
+    const entries: NormalizedRevenue[] = [
+      makeEntry({ source: "unknown" }),
+      makeEntry({ source: "unknown" }),
+      makeEntry(),
+      makeEntry(),
+      makeEntry(),
+    ];
+
+    const result = detectNormalizationDrift(entries, zeroBaseline);
+    const sourceCheck = result.checks.find((c) => c.metric === "unknown_source_rate");
+
+    expect(sourceCheck?.flag).toBe("unknown_source_drift");
+    expect(sourceCheck?.score).toBe(1); // clamped to maximum
   });
 });
